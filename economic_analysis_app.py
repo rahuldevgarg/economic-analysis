@@ -1,4 +1,3 @@
-from flask import Flask, request, jsonify, send_file
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
 import aiohttp
@@ -19,8 +18,6 @@ import zipfile
 import os
 import sys
 
-# Initialize Flask app
-app = Flask(__name__)
 
 # MongoDB setup
 mongo_url = os.getenv('MONGO_URL', 'mongodb://localhost:27017/')

@@ -1,0 +1,8 @@
+Flask==2.2.3
+aiohttp==3.8.4
+pandas==2.0.1
+openai==0.27.1
+pymongo==4.8.0
+matplotlib==3.7.1
+fpdf==1.7.2
+reportlab==3.6.1
