@@ -1,11 +1,6 @@
-from concurrent.futures import ThreadPoolExecutor
-import asyncio
-import aiohttp
-import pandas as pd
-import openai
-import pymongo
-import logging
 from datetime import datetime, timedelta
+import pandas as pd
+import io
 import matplotlib.pyplot as plt
 from fpdf import FPDF
 from reportlab.lib.pagesizes import letter
@@ -13,23 +8,25 @@ from reportlab.pdfgen import canvas
 from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Image
 from reportlab.lib.styles import getSampleStyleSheet
-import io
-import zipfile
+import aiohttp
+import asyncio
+import openai
+import pymongo
+import logging
+import sys
 
-# MongoDB setup
+# Initialize MongoDB client and OpenAI API key
 client = pymongo.MongoClient('mongodb://localhost:27017/')
 db = client['economic_analysis_db']
 results_collection = db['results']
 logs_collection = db['logs']
 analysis_collection = db['analysis']
 
-# Replace with your OpenAI API key
 openai.api_key = 'your_openai_api_key_here'
 
 # Setup logging
 logging.basicConfig(filename='api.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Async HTTP session
 async def fetch_news(session, keyword, api_key, num_articles=5):
     url = f"https://newsapi.org/v2/everything?q={keyword}&apiKey={api_key}"
     async with session.get(url) as response:
@@ -98,48 +95,25 @@ def analyze_data_with_llm(prompt):
         logging.error(f"OpenAI API error: {e}")
         return "Error in LLM analysis."
 
-def aggregate_data():
-    results_cursor = results_collection.find()
-    economic_data = {}
-    news_data = []
-
-    for result in results_cursor:
-        for key, df in result.get('economic_data', {}).items():
-            if key not in economic_data:
-                economic_data[key] = pd.DataFrame(df)
-            else:
-                economic_data[key] = pd.concat([economic_data[key], pd.DataFrame(df)], ignore_index=True)
-        
-        news_data.extend(result.get('news_data', []))
-
-    return economic_data, news_data
-
 def gather_data(country_code, years):
     try:
-        # Date range
         end_date = datetime.today()
         start_date = end_date - timedelta(days=years * 365)
         start_date_str = start_date.strftime('%Y-%m-%d')
         end_date_str = end_date.strftime('%Y-%m-%d')
 
-        # Define targeted news keywords
         keywords = ["banking", "finance", "stock deals", "government deals", "global crimes"]
         api_key = 'your_newsapi_key_here'
 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
-        # Gather economic data and fetch news data asynchronously
         economic_data = loop.run_until_complete(gather_economic_data(country_code, start_date_str, end_date_str))
         news_data = loop.run_until_complete(get_targeted_news_data(keywords, api_key))
 
-        # Generate comprehensive prompt
         prompt = generate_prompt(economic_data, news_data)
-
-        # Analyze with LLM
         analysis = analyze_data_with_llm(prompt)
 
-        # Store results in MongoDB
         results_document = {
             'timestamp': datetime.now(),
             'start_date': start_date_str,
@@ -150,8 +124,8 @@ def gather_data(country_code, years):
         }
         results_collection.insert_one(results_document)
 
-        return analysis
-
+        logging.info('Data gathered and analyzed successfully.')
+    
     except Exception as e:
         logging.error(f"Error in gather_data: {e}")
         logs_collection.insert_one({
@@ -159,26 +133,43 @@ def gather_data(country_code, years):
             'type': 'error',
             'message': f"Error in gather_data: {e}"
         })
-        return "An unexpected error occurred."
 
 def reanalyze_data_process():
-    economic_data, news_data = aggregate_data()
+    try:
+        results_cursor = results_collection.find()
+        economic_data = {}
+        news_data = []
 
-    prompt = generate_prompt(economic_data, news_data)
+        for result in results_cursor:
+            for key, df in result.get('economic_data', {}).items():
+                if key not in economic_data:
+                    economic_data[key] = pd.DataFrame(df)
+                else:
+                    economic_data[key] = pd.concat([economic_data[key], pd.DataFrame(df)], ignore_index=True)
+            
+            news_data.extend(result.get('news_data', []))
 
-    analysis = analyze_data_with_llm(prompt)
+        prompt = generate_prompt(economic_data, news_data)
+        analysis = analyze_data_with_llm(prompt)
 
-    analysis_document = {
-        'timestamp': datetime.now(),
-        'analysis': analysis
-    }
-    analysis_collection.insert_one(analysis_document)
+        analysis_document = {
+            'timestamp': datetime.now(),
+            'analysis': analysis
+        }
+        analysis_collection.insert_one(analysis_document)
 
-    return analysis
+        logging.info('Reanalysis completed successfully.')
+
+    except Exception as e:
+        logging.error(f"Error in reanalyze_data_process: {e}")
+        logs_collection.insert_one({
+            'timestamp': datetime.now(),
+            'type': 'error',
+            'message': f"Error in reanalyze_data_process: {e}"
+        })
 
 def generate_short_pdf(summary_text):
     try:
-        # Generate PDF
         pdf = FPDF()
         pdf.add_page()
         pdf.set_font('Arial', 'B', 12)
@@ -187,12 +178,14 @@ def generate_short_pdf(summary_text):
         pdf.set_font('Arial', '', 12)
         pdf.multi_cell(0, 10, summary_text)
 
-        # Save PDF to an in-memory file
         pdf_output = io.BytesIO()
         pdf.output(pdf_output)
         pdf_output.seek(0)
 
-        return pdf_output
+        with open('short_report.pdf', 'wb') as f:
+            f.write(pdf_output.read())
+
+        logging.info('Short PDF generated successfully.')
 
     except Exception as e:
         logging.error(f"Error in generate_short_pdf: {e}")
@@ -201,21 +194,17 @@ def generate_short_pdf(summary_text):
             'type': 'error',
             'message': f"Error in generate_short_pdf: {e}"
         })
-        return "An unexpected error occurred."
 
 def generate_long_pdf(economic_data, graphs):
     try:
-        # Generate PDF
         doc = SimpleDocTemplate("long_report.pdf", pagesize=letter)
         styles = getSampleStyleSheet()
         story = []
 
-        # Title
         story.append(Paragraph("Economic Data Analysis Report - Detailed Report", styles['Title']))
         story.append(Paragraph("This report provides detailed insights, including graphs and tables.", styles['BodyText']))
         story.append(Paragraph("<br/><br/>", styles['BodyText']))
 
-        # Adding tables
         for title, df in economic_data.items():
             story.append(Paragraph(title, styles['Heading2']))
             if df:
@@ -232,15 +221,8 @@ def generate_long_pdf(economic_data, graphs):
                 story.append(table)
                 story.append(Paragraph("<br/><br/>", styles['BodyText']))
 
-        # Adding graphs
-        for title, image_file in graphs.items():
-            story.append(Paragraph(title, styles['Heading2']))
-            story.append(Image(image_file, width=400, height=300))
-            story.append(Paragraph("<br/><br/>", styles['BodyText']))
-
         doc.build(story)
-
-        return 'long_report.pdf'
+        logging.info('Long PDF generated successfully.')
 
     except Exception as e:
         logging.error(f"Error in generate_long_pdf: {e}")
@@ -249,23 +231,23 @@ def generate_long_pdf(economic_data, graphs):
             'type': 'error',
             'message': f"Error in generate_long_pdf: {e}"
         })
-        return "An unexpected error occurred."
 
 if __name__ == '__main__':
-    # Example usage:
-    # Gather data
-    result = gather_data('united-states', 2)
-    print("Analysis Result:", result)
+    step = sys.argv[1]
 
-    # Reanalyze data
-    result = reanalyze_data_process()
-    print("Reanalysis Result:", result)
-
-    # Generate short PDF
-    pdf_output = generate_short_pdf("Sample summary text")
-    with open("short_report.pdf", "wb") as f:
-        f.write(pdf_output.getvalue())
-
-    # Generate long PDF
-    result = generate_long_pdf({}, {})
-    print("Long PDF generated:", result)
+    if step == 'gather_data':
+        country_code = sys.argv[2]
+        years = int(sys.argv[3])
+        gather_data(country_code, years)
+    elif step == 'reanalyze_data':
+        reanalyze_data_process()
+    elif step == 'generate_short_pdf':
+        summary_text = 'Generated summary text'
+        generate_short_pdf(summary_text)
+    elif step == 'generate_long_pdf':
+        economic_data = {'data': 'sample'}  # Example data
+        graphs = {}
+        generate_long_pdf(economic_data, graphs)
+    else:
+        print(f'Unknown step: {step}', file=sys.stderr)
+        sys.exit(1)
