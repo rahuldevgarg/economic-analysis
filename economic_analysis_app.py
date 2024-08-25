@@ -1,6 +1,12 @@
-from datetime import datetime, timedelta
+from flask import Flask, request, jsonify, send_file
+from concurrent.futures import ThreadPoolExecutor
+import asyncio
+import aiohttp
 import pandas as pd
-import io
+import openai
+import pymongo
+import logging
+from datetime import datetime, timedelta
 import matplotlib.pyplot as plt
 from fpdf import FPDF
 from reportlab.lib.pagesizes import letter
@@ -8,27 +14,41 @@ from reportlab.pdfgen import canvas
 from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Image
 from reportlab.lib.styles import getSampleStyleSheet
-import aiohttp
-import asyncio
-import openai
-import pymongo
-import logging
+import io
+import zipfile
+import os
 import sys
 
-# Initialize MongoDB client and OpenAI API key
-client = pymongo.MongoClient('mongodb://localhost:27017/')
+# Initialize Flask app
+app = Flask(__name__)
+
+# MongoDB setup
+mongo_url = os.getenv('MONGO_URL', 'mongodb://localhost:27017/')
+client = pymongo.MongoClient(mongo_url)
 db = client['economic_analysis_db']
+
+# Ensure collections are created
+collections = ['results', 'logs', 'analysis']
+for coll in collections:
+    if coll not in db.list_collection_names():
+        db.create_collection(coll)
+
 results_collection = db['results']
 logs_collection = db['logs']
 analysis_collection = db['analysis']
 
-openai.api_key = 'your_openai_api_key_here'
+# Set OpenAI API key from environment
+openai.api_key = os.getenv('OPENAI_API_KEY', 'your_openai_api_key_here')
+
+# Set News API key from environment
+news_api_key = os.getenv('NEWSAPI_KEY', 'your_newsapi_key_here')
 
 # Setup logging
 logging.basicConfig(filename='api.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-async def fetch_news(session, keyword, api_key, num_articles=5):
-    url = f"https://newsapi.org/v2/everything?q={keyword}&apiKey={api_key}"
+# Async HTTP session
+async def fetch_news(session, keyword, num_articles=5):
+    url = f"https://newsapi.org/v2/everything?q={keyword}&apiKey={news_api_key}"
     async with session.get(url) as response:
         response.raise_for_status()
         data = await response.json()
@@ -40,6 +60,7 @@ async def fetch_news(session, keyword, api_key, num_articles=5):
             'keyword': keyword
         } for article in articles]
 
+# Helper functions
 async def gather_economic_data(country_code, start_date, end_date):
     date_range = pd.date_range(start=start_date, end=end_date, freq='M')
     gdp_data = pd.DataFrame({'Date': date_range, 'GDP': ['21T'] * len(date_range)})
@@ -56,9 +77,9 @@ async def gather_economic_data(country_code, start_date, end_date):
         'Debt': debt_data.to_dict(orient='records')
     }
 
-async def get_targeted_news_data(keywords, api_key, num_articles=5):
+async def get_targeted_news_data(keywords, num_articles=5):
     async with aiohttp.ClientSession() as session:
-        tasks = [fetch_news(session, keyword, api_key, num_articles) for keyword in keywords]
+        tasks = [fetch_news(session, keyword, num_articles) for keyword in keywords]
         news_data_lists = await asyncio.gather(*tasks)
         return [item for sublist in news_data_lists for item in sublist]
 
@@ -95,25 +116,56 @@ def analyze_data_with_llm(prompt):
         logging.error(f"OpenAI API error: {e}")
         return "Error in LLM analysis."
 
-def gather_data(country_code, years):
+def aggregate_data():
+    results_cursor = results_collection.find()
+    economic_data = {}
+    news_data = []
+
+    for result in results_cursor:
+        for key, df in result.get('economic_data', {}).items():
+            if key not in economic_data:
+                economic_data[key] = pd.DataFrame(df)
+            else:
+                economic_data[key] = pd.concat([economic_data[key], pd.DataFrame(df)], ignore_index=True)
+        
+        news_data.extend(result.get('news_data', []))
+
+    return economic_data, news_data
+
+# Thread pool executor for running synchronous functions in separate threads
+executor = ThreadPoolExecutor(max_workers=5)
+
+@app.route('/gather_data', methods=['POST'])
+def gather_data():
     try:
+        # Get data from request
+        data = request.json
+        country_code = data.get('country_code', 'united-states')
+        years = int(data.get('years', 2))  # Default to 2 years if not provided
+
+        # Date range
         end_date = datetime.today()
         start_date = end_date - timedelta(days=years * 365)
         start_date_str = start_date.strftime('%Y-%m-%d')
         end_date_str = end_date.strftime('%Y-%m-%d')
 
+        # Define targeted news keywords
         keywords = ["banking", "finance", "stock deals", "government deals", "global crimes"]
-        api_key = 'your_newsapi_key_here'
 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
+        # Gather economic data and fetch news data asynchronously
         economic_data = loop.run_until_complete(gather_economic_data(country_code, start_date_str, end_date_str))
-        news_data = loop.run_until_complete(get_targeted_news_data(keywords, api_key))
+        news_data = loop.run_until_complete(get_targeted_news_data(keywords))
 
+        # Generate comprehensive prompt
         prompt = generate_prompt(economic_data, news_data)
+
+        # Analyze with LLM
         analysis = analyze_data_with_llm(prompt)
 
+        # Store results in MongoDB
         results_document = {
             'timestamp': datetime.now(),
             'start_date': start_date_str,
@@ -124,52 +176,58 @@ def gather_data(country_code, years):
         }
         results_collection.insert_one(results_document)
 
-        logging.info('Data gathered and analyzed successfully.')
-    
+        return jsonify({"message": "Data gathered and analyzed successfully.", "analysis": analysis}), 200
+
     except Exception as e:
-        logging.error(f"Error in gather_data: {e}")
+        logging.error(f"Error in /gather_data: {e}")
         logs_collection.insert_one({
             'timestamp': datetime.now(),
             'type': 'error',
-            'message': f"Error in gather_data: {e}"
+            'message': f"Error in /gather_data: {e}"
         })
+        return jsonify({"error": "An unexpected error occurred."}), 500
+
+@app.route('/reanalyze_data', methods=['GET'])
+def reanalyze_data():
+    try:
+        # Run aggregation and analysis in a separate thread
+        future = executor.submit(reanalyze_data_process)
+        result = future.result()
+
+        return jsonify({"message": "Reanalysis completed successfully.", "analysis": result}), 200
+
+    except Exception as e:
+        logging.error(f"Error in /reanalyze_data: {e}")
+        logs_collection.insert_one({
+            'timestamp': datetime.now(),
+            'type': 'error',
+            'message': f"Error in /reanalyze_data: {e}"
+        })
+        return jsonify({"error": "An unexpected error occurred."}), 500
 
 def reanalyze_data_process():
+    economic_data, news_data = aggregate_data()
+
+    prompt = generate_prompt(economic_data, news_data)
+
+    analysis = analyze_data_with_llm(prompt)
+
+    analysis_document = {
+        'timestamp': datetime.now(),
+        'analysis': analysis
+    }
+    analysis_collection.insert_one(analysis_document)
+
+    return analysis
+
+@app.route('/generate_short_pdf', methods=['POST'])
+def generate_short_pdf():
     try:
-        results_cursor = results_collection.find()
-        economic_data = {}
-        news_data = []
+        # Get summary text from request
+        data = request.json
+        summary_text = data.get('summary', '')
 
-        for result in results_cursor:
-            for key, df in result.get('economic_data', {}).items():
-                if key not in economic_data:
-                    economic_data[key] = pd.DataFrame(df)
-                else:
-                    economic_data[key] = pd.concat([economic_data[key], pd.DataFrame(df)], ignore_index=True)
-            
-            news_data.extend(result.get('news_data', []))
-
-        prompt = generate_prompt(economic_data, news_data)
-        analysis = analyze_data_with_llm(prompt)
-
-        analysis_document = {
-            'timestamp': datetime.now(),
-            'analysis': analysis
-        }
-        analysis_collection.insert_one(analysis_document)
-
-        logging.info('Reanalysis completed successfully.')
-
-    except Exception as e:
-        logging.error(f"Error in reanalyze_data_process: {e}")
-        logs_collection.insert_one({
-            'timestamp': datetime.now(),
-            'type': 'error',
-            'message': f"Error in reanalyze_data_process: {e}"
-        })
-
-def generate_short_pdf(summary_text):
-    try:
+        # Generate PDF
         pdf = FPDF()
         pdf.add_page()
         pdf.set_font('Arial', 'B', 12)
@@ -178,33 +236,41 @@ def generate_short_pdf(summary_text):
         pdf.set_font('Arial', '', 12)
         pdf.multi_cell(0, 10, summary_text)
 
+        # Save PDF to an in-memory file
         pdf_output = io.BytesIO()
         pdf.output(pdf_output)
         pdf_output.seek(0)
 
-        with open('short_report.pdf', 'wb') as f:
-            f.write(pdf_output.read())
-
-        logging.info('Short PDF generated successfully.')
+        return send_file(pdf_output, as_attachment=True, attachment_filename='short_report.pdf', mimetype='application/pdf')
 
     except Exception as e:
-        logging.error(f"Error in generate_short_pdf: {e}")
+        logging.error(f"Error in /generate_short_pdf: {e}")
         logs_collection.insert_one({
             'timestamp': datetime.now(),
             'type': 'error',
-            'message': f"Error in generate_short_pdf: {e}"
+            'message': f"Error in /generate_short_pdf: {e}"
         })
+        return jsonify({"error": "An unexpected error occurred."}), 500
 
-def generate_long_pdf(economic_data, graphs):
+@app.route('/generate_long_pdf', methods=['POST'])
+def generate_long_pdf():
     try:
+        # Get data from request
+        data = request.json
+        economic_data = data.get('economic_data', {})
+        graphs = data.get('graphs', {})
+
+        # Generate PDF
         doc = SimpleDocTemplate("long_report.pdf", pagesize=letter)
         styles = getSampleStyleSheet()
         story = []
 
+        # Title
         story.append(Paragraph("Economic Data Analysis Report - Detailed Report", styles['Title']))
         story.append(Paragraph("This report provides detailed insights, including graphs and tables.", styles['BodyText']))
         story.append(Paragraph("<br/><br/>", styles['BodyText']))
 
+        # Adding tables
         for title, df in economic_data.items():
             story.append(Paragraph(title, styles['Heading2']))
             if df:
@@ -221,16 +287,24 @@ def generate_long_pdf(economic_data, graphs):
                 story.append(table)
                 story.append(Paragraph("<br/><br/>", styles['BodyText']))
 
+        # Adding graphs
+        for title, image_file in graphs.items():
+            story.append(Paragraph(title, styles['Heading2']))
+            story.append(Image(image_file, width=400, height=300))
+            story.append(Paragraph("<br/><br/>", styles['BodyText']))
+
         doc.build(story)
-        logging.info('Long PDF generated successfully.')
+
+        return send_file('long_report.pdf', as_attachment=True, attachment_filename='long_report.pdf', mimetype='application/pdf')
 
     except Exception as e:
-        logging.error(f"Error in generate_long_pdf: {e}")
+        logging.error(f"Error in /generate_long_pdf: {e}")
         logs_collection.insert_one({
             'timestamp': datetime.now(),
             'type': 'error',
-            'message': f"Error in generate_long_pdf: {e}"
+            'message': f"Error in /generate_long_pdf: {e}"
         })
+        return jsonify({"error": "An unexpected error occurred."}), 500
 
 if __name__ == '__main__':
     step = sys.argv[1]
