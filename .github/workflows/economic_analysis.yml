@@ -1,0 +1,55 @@
+name: Economic Analysis Workflow
+
+on:
+  workflow_dispatch:
+    inputs:
+      steps:
+        description: 'Select the steps to execute'
+        required: true
+        type: checkboxes
+        options:
+          - 'gather_data'
+          - 'reanalyze_data'
+          - 'generate_short_pdf'
+          - 'generate_long_pdf'
+      sequence:
+        description: 'Order of execution (priority numbers, comma-separated)'
+        required: true
+        type: string
+
+jobs:
+  run_steps:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.8'
+
+      - name: Install dependencies
+        run: |
+         pip install pandas aiohttp openai pymongo fpdf reportlab matplotlib
+
+      - name: Set up environment variables
+        run: echo "MONGO_URL=${{ secrets.MONGO_URL }}" >> $GITHUB_ENV
+      - name: Set up environment variables  
+        run: echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}" >> $GITHUB_ENV
+      - name: Set up environment variables  
+        run: echo "NEWSAPI_KEY=${{ secrets.NEWSAPI_KEY }}" >> $GITHUB_ENV
+
+      - name: Run selected steps
+        run: |
+          steps="${{ github.event.inputs.steps }}"
+          sequence="${{ github.event.inputs.sequence }}"
+          IFS=',' read -r -a ordered_steps <<< "$sequence"
+          for step in "${ordered_steps[@]}"; do
+            if [[ "$steps" == *"$step"* ]]; then
+              echo "Running $step"
+              python economic_analysis_app.py $step
+            else
+              echo "Skipping $step"
+            fi
+          done
