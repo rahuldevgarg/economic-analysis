@@ -1,27 +1,34 @@
-name: Economic Analysis Workflow
+name: Economic Analysis
 
 on:
   workflow_dispatch:
     inputs:
       steps:
-        description: 'Select the steps to execute'
+        description: 'Select the steps to run (comma-separated order, e.g., gather_data,generate_short_pdf,generate_long_pdf,reanalyze_data)'
         required: true
-        type: checkboxes
-        options:
-          - 'gather_data'
-          - 'reanalyze_data'
-          - 'generate_short_pdf'
-          - 'generate_long_pdf'
+        default: 'gather_data,generate_short_pdf,generate_long_pdf'
+        type: string
       sequence:
         description: 'Order of execution (priority numbers, comma-separated)'
         required: true
+        default: '0,1,2'
+        type: string
+      country_code:
+        description: 'Country code for data gathering'
+        required: true
+        default: 'united-states'
+        type: string
+      years:
+        description: 'Number of years for data gathering'
+        required: true
+        default: '2'
         type: string
 
 jobs:
   run_steps:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v3
 
       - name: Set up Python
@@ -31,25 +38,33 @@ jobs:
 
       - name: Install dependencies
         run: |
-         pip install pandas aiohttp openai pymongo fpdf reportlab matplotlib
+          pip install pandas aiohttp openai pymongo fpdf reportlab matplotlib
 
-      - name: Set up environment variables
-        run: echo "MONGO_URL=${{ secrets.MONGO_URL }}" >> $GITHUB_ENV
-      - name: Set up environment variables  
-        run: echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}" >> $GITHUB_ENV
-      - name: Set up environment variables  
-        run: echo "NEWSAPI_KEY=${{ secrets.NEWSAPI_KEY }}" >> $GITHUB_ENV
-
-      - name: Run selected steps
+      - name: Execute Steps
+        id: execute_steps
         run: |
           steps="${{ github.event.inputs.steps }}"
+          country_code="${{ github.event.inputs.country_code }}"
+          years="${{ github.event.inputs.years }}"
           sequence="${{ github.event.inputs.sequence }}"
+
           IFS=',' read -r -a ordered_steps <<< "$sequence"
           for step in "${ordered_steps[@]}"; do
             if [[ "$steps" == *"$step"* ]]; then
               echo "Running $step"
-              python economic_analysis_app.py $step
+              python economic_analysis_app.py "$step" "$country_code" "$years"
             else
               echo "Skipping $step"
             fi
           done
+          IFS=',' read -r -a steps_array <<< "$steps"
+
+          for step in "${steps_array[@]}"; do
+            echo "Running step: $step"
+            python economic_analysis_app.py "$step" "$country_code" "$years"
+          done
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          NEWSAPI_KEY: ${{ secrets.NEWSAPI_KEY }}
+          MONGO_URL: ${{ secrets.MONGO_URL }}
+
